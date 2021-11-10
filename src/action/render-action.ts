@@ -3,27 +3,54 @@ import {
   parsePlatform,
   resolveOs,
 } from "../util/github-actions-util";
+import { nameOf } from "../util/object-util";
 import { stringify, scalarOptions } from "yaml";
 
 export type OptionsType = {
   build: {
-    os: string[];
-    arch: string[];
-    node?: string[];
-  };
-  node?: {
-    package: {
-      name: string;
+    target: {
+      os: string[];
+      arch: string[];
+      node?: string[];
     };
-    registries?: {
-      name: "gh" | "npm";
+    nodePkg?: boolean;
+  };
+  publish?: {
+    nodePkg?: {
+      registry: "gh" | "npm";
       public?: boolean;
     }[];
-  };
-  release?: {
-    registries: "gh"[];
+    release?: {
+      registry: "gh";
+      nodePkg?: boolean;
+    }[];
   };
 };
+
+function ifX(condition: any, text: string, elseX?: string) {
+  return condition ? text : elseX ?? "";
+}
+
+type MetaType = {
+  targetOs: string;
+  targetNode: string;
+  targetName: string;
+  nodePkg: {
+    owner: string;
+    artifactName: string;
+    fileName: string;
+  };
+};
+
+const meta = nameOf<MetaType>({
+  subkeys: ["nodePkg"],
+  onGet: (name) => `\${{ fromJson(steps.meta.outputs.result).${name} }}`,
+});
+
+const publishMeta = nameOf<MetaType>({
+  subkeys: ["nodePkg"],
+  onGet: (name) => `\${{ fromJson(needs.build.outputs.publish).${name} }}`,
+});
 
 export async function renderAction(options: OptionsType) {
   const workflow: WorkflowType = {
@@ -39,37 +66,80 @@ export async function renderAction(options: OptionsType) {
         "runs-on": "${{ matrix.os }}",
         strategy: {
           matrix: {
-            os: options.build.os.map(resolveOs),
-            arch: options.build.arch,
-            ...(options.build.node && {
-              node: options.build.node,
+            os: options.build.target.os.map(resolveOs),
+            arch: options.build.target.arch,
+            ...(options.build.target.node && {
+              node: options.build.target.node,
             }),
-            include: options.build.os.map((os, index) => ({
+            include: options.build.target.os.map((os, index) => ({
               os: resolveOs(os),
               platform: parsePlatform(os),
               publish: index === 0,
             })),
           },
         },
-        name: options.node
+        name: options.build.target.node
           ? "Build on node-v${{ matrix.node }}-${{ matrix.platform }}-${{ matrix.arch }}"
           : "Build on ${{ matrix.platform }}-${{ matrix.arch }}",
         outputs: {
-          publish_build_os: "${{ steps.publish-var.outputs.build_os }}",
-          publish_build_arch: "${{ steps.publish-var.outputs.build_arch }}",
-          publish_build_name: "${{ steps.publish-var.outputs.build_name }}",
-          ...(options.node && {
-            publish_build_node: "${{ steps.publish-var.outputs.build_node }}",
-            publish_pkg_scope: "${{ steps.publish-var.outputs.pkg_scope }}",
-            publish_pkg_build_name:
-              "${{ steps.publish-var.outputs.pkg_build_name }}",
-          }),
+          build: "${{ steps.meta.outputs.build }}",
+          publish: "${{ steps.meta.outputs.publish }}",
         },
         steps: [
           {
             uses: "actions/checkout@v2",
           },
-          ...(options.node
+          {
+            id: "meta",
+            name: "Build metadata",
+            uses: "actions/github-script@v5",
+            env: {
+              REPO_NAME: "${{ github.repository }}",
+              MATRIX_OS: "${{ matrix.os }}",
+              MATRIX_PLATFORM: "${{ matrix.platform }}",
+              MATRIX_ARCH: "${{ matrix.arch }}",
+              MATRIX_PUBLISH: "${{ matrix.publish }}",
+              ...(options.build.target.node && {
+                MATRIX_NODE: "${{ matrix.node }}",
+              }),
+            },
+            with: {
+              script: `
+                const env = process.env;
+                const result = {};
+                result.targetOs = env.MATRIX_OS;
+                ${ifX(
+                  options.build.target.node?.length,
+                  "result.targetNode = env.MATRIX_NODE;"
+                )}
+                result.targetName = ${ifX(
+                  options.build.target.node?.length,
+                  `"node-v" + env.MATRIX_NODE + "-" + env.MATRIX_PLATFORM + "-" + env.MATRIX_ARCH`,
+                  `env.MATRIX_PLATFORM + "-" + env.MATRIX_ARCH`
+                )};
+                ${ifX(
+                  options.build.nodePkg,
+                  `
+                  const pkg = require('./package.json');
+                  const [pkgNameOwner, pkgName] = pkg.name.slice(1).split("/");
+                  result.nodePkg = {};
+                  result.nodePkg.owner = pkgNameOwner;
+                  const pkgFullName = pkgNameOwner + "-" + pkgName + "-v" + pkg.version;
+                  result.nodePkg.artifactName = pkgFullName + "-" + result.targetName + ".nodepkg";
+                  result.nodePkg.fileName = result.nodePkg.artifactName + ".tgz";
+                  `
+                )}
+                if (env.MATRIX_PUBLISH)
+                  core.setOutput('publish', result);
+                return result;
+              `
+                .split(/\n/g)
+                .map((v) => v.trim())
+                .filter((v) => !!v.length)
+                .join("\n"),
+            },
+          },
+          ...(options.build.nodePkg
             ? [
                 {
                   uses: "actions/setup-node@v2",
@@ -79,138 +149,123 @@ export async function renderAction(options: OptionsType) {
                 },
               ]
             : []),
-          {
-            id: "build-var",
-            run: [
-              ...(options.node
-                ? [
-                    `BUILD_NAME=node-v\${{ matrix.node }}-\${{ matrix.platform }}-\${{ matrix.arch }}`,
-                  ]
-                : [`BUILD_NAME=\${{ matrix.platform }}-\${{ matrix.arch }}`]),
-              `echo "::set-output name=build_name::\${BUILD_NAME}"`,
-              ...(options.node
-                ? [
-                    `PKG_SCOPE=$(node -e "console.log(require('./package.json').name.split('/').shift().slice(1))")`,
-                    `PKG_NAME=$(node -e "console.log(require('./package.json').name.split('/').pop())")`,
-                    `PKG_VERSION=$(node -e "console.log(require('./package.json').version)")`,
-                    `echo "::set-output name=pkg_scope::\${PKG_SCOPE}"`,
-                    `echo "::set-output name=pkg_name::\${PKG_NAME}"`,
-                    `echo "::set-output name=pkg_version::\${PKG_VERSION}"`,
-                    `echo "::set-output name=pkg_build_name::\${PKG_SCOPE}-\${PKG_NAME}-v\${PKG_VERSION}-\${BUILD_NAME}.tgz"`,
-                  ]
-                : []),
-            ].join("\n"),
-          },
-          {
-            id: "publish-var",
-            if: "matrix.publish",
-            run: [
-              ...(options.node
-                ? [
-                    `echo "::set-output name=pkg_scope::\${{ steps.build-var.outputs.pkg_scope }}"`,
-                    `echo "::set-output name=pkg_build_name::\${{ steps.build-var.outputs.pkg_build_name }}"`,
-                  ]
-                : []),
-              `echo "::set-output name=build_os::\${{ matrix.os }}"`,
-              `echo "::set-output name=build_arch::\${{ matrix.arch }}"`,
-              `echo "::set-output name=build_node::\${{ matrix.node }}"`,
-              `echo "::set-output name=build_name::\${{ steps.build-var.outputs.build_name }}"`,
-            ].join("\n"),
-          },
-          ...(options.node
+          ...(options.build.nodePkg
             ? [
                 {
-                  name: "Test",
+                  run: "mkdir -p /tmp/artifact/nodepkg",
+                },
+                {
+                  name: "Test Node.js pkg",
                   run: "npm run test --if-present",
                 },
                 {
-                  name: "Pack",
+                  name: "Pack Node.js pkg",
                   run: [
                     "npm pack",
-                    "mv *.tgz ${{ steps.build-var.outputs.pkg_build_name }}",
+                    `mv *.tgz /tmp/artifact/nodepkg/${meta.nodePkg.fileName}`,
                   ].join("\n"),
+                },
+                {
+                  name: "Upload Node.js pkg",
+                  uses: "actions/upload-artifact@v2",
+                  with: {
+                    name: meta.nodePkg.artifactName,
+                    path: "/tmp/artifact/nodepkg/*",
+                    "if-no-files-found": "error",
+                    "retention-days": 7,
+                  },
                 },
               ]
             : []),
-          {
-            name: "Upload",
-            uses: "actions/upload-artifact@v2",
-            with: {
-              name: "${{ steps.build-var.outputs.build_name }}",
-              path: "*.tgz",
-              "if-no-files-found": "error",
-              "retention-days": 7,
-            },
-          },
         ],
       },
-      ...(options.release?.registries?.includes("gh") && {
-        "publish-github-release": {
+      ...(options.publish?.release ?? []).reduce((result, publish) => {
+        result[`publish-github-release`] = {
           if: "startsWith(github.ref, 'refs/tags/')",
           "runs-on": "ubuntu-latest",
           needs: ["build"],
-          name: "Publish GitHub release",
+          name: "Publish release in GitHub",
           steps: [
-            {
-              name: "Download",
-              uses: "actions/download-artifact@v2",
-            },
             {
               name: "Create",
               uses: "softprops/action-gh-release@v1",
               env: {
                 GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
               },
+            },
+            ...(publish.nodePkg
+              ? [
+                  {
+                    run: "mkdir -p /tmp/artifact/nodepkg",
+                  },
+                  {
+                    name: "Download Node.js pkg",
+                    uses: "actions/download-artifact@v2",
+                    with: {
+                      path: "/tmp/artifact/nodepkg",
+                    },
+                  },
+                  {
+                    name: "Attach Node.js pkg",
+                    uses: "softprops/action-gh-release@v1",
+                    env: {
+                      GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
+                    },
+                    with: {
+                      files: "/tmp/artifact/nodepkg/**/*.tgz",
+                    },
+                  },
+                ]
+              : []),
+          ],
+        };
+        return result;
+      }, {} as Record<string, WorkflowType["jobs"][number]>),
+      ...(options.publish?.nodePkg ?? []).reduce((result, publish) => {
+        result[
+          `publish-${publish.registry === "gh" ? "github" : "npm"}-nodepkg`
+        ] = {
+          if: "startsWith(github.ref, 'refs/tags/')",
+          "runs-on": publishMeta.targetOs,
+          needs: ["build"],
+          name: `Publish Node.js pkg in ${
+            publish.registry === "gh" ? "GitHub" : "NPM"
+          }`,
+          steps: [
+            {
+              name: "Download",
+              uses: "actions/download-artifact@v2",
               with: {
-                files: "**/*.tgz",
+                name: publishMeta.nodePkg.artifactName,
+              },
+            },
+            {
+              uses: "actions/setup-node@v2",
+              with: {
+                scope: `@${publishMeta.nodePkg.owner}`,
+                "node-version": `${publishMeta.targetNode}`,
+                "registry-url":
+                  publish.registry === "gh"
+                    ? "https://npm.pkg.github.com"
+                    : "https://registry.npmjs.org",
+              },
+            },
+            {
+              name: "Publish",
+              run: `npm publish ${publishMeta.nodePkg.fileName} ${
+                publish.public ? ` --access public` : ""
+              }`,
+              env: {
+                NODE_AUTH_TOKEN:
+                  publish.registry === "gh"
+                    ? "${{ secrets.GITHUB_TOKEN }}"
+                    : "${{ secrets.NPM_TOKEN }}",
               },
             },
           ],
-        },
-      }),
-      ...(options.node?.registries ?? []).reduce((result, publish) => {
-        result[`publish-${publish.name === "gh" ? "github" : "npm"}-package`] =
-          {
-            if: "startsWith(github.ref, 'refs/tags/')",
-            "runs-on": "${{ needs.build.outputs.publish_build_os }}",
-            needs: ["build"],
-            name: `Publish ${publish.name === "gh" ? "GitHub" : "NPM"} package`,
-            steps: [
-              {
-                name: "Download",
-                uses: "actions/download-artifact@v2",
-                with: {
-                  name: "${{ needs.build.outputs.publish_build_name }}",
-                },
-              },
-              {
-                uses: "actions/setup-node@v2",
-                with: {
-                  scope: "@${{ needs.build.outputs.publish_pkg_scope }}",
-                  "node-version":
-                    "${{ needs.build.outputs.publish_build_node }}",
-                  "registry-url":
-                    publish.name === "gh"
-                      ? "https://npm.pkg.github.com"
-                      : "https://registry.npmjs.org",
-                },
-              },
-              {
-                name: "Publish",
-                run: `npm publish \${{ needs.build.outputs.publish_pkg_build_name }}${
-                  publish.public ? ` --access public` : ""
-                }`,
-                env: {
-                  NODE_AUTH_TOKEN:
-                    publish.name === "gh"
-                      ? "${{ secrets.GITHUB_TOKEN }}"
-                      : "${{ secrets.NPM_TOKEN }}",
-                },
-              },
-            ],
-          };
+        };
         return result;
-      }, {} as Record<string, any>),
+      }, {} as Record<string, WorkflowType["jobs"][number]>),
     },
   };
   const lineWidth = scalarOptions.str.fold.lineWidth;

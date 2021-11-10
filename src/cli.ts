@@ -29,42 +29,53 @@ export function parseStringListOption(value: string) {
   return value.split(",").map((v) => v.trim());
 }
 
+export function parseBooleanOption(value: string) {
+  value = value.trim().toLowerCase();
+  return value === "true" || value === "1";
+}
+
 export function parseNodePublishOption(values: string[]) {
   return values?.map((v) => {
-    const [name, flag] = v.split(":");
-    if (!["gh", "npm"].includes(name))
-      throw new Error(`Invalid node registry: ${name}`);
+    const [registry, flag] = v.split(":");
+    if (!["gh", "npm"].includes(registry))
+      throw new Error(`Invalid node registry: ${registry}`);
     if (flag && flag !== "public")
       throw new Error(`Invalid node registry flag: ${flag}`);
     return {
-      name: name as "gh" | "npm",
+      registry: registry as "gh" | "npm",
       public: flag === "public",
     };
   });
 }
 
 export function parseRenderActionOptions(options: {
-  buildOs?: string[];
-  buildArch?: string[];
-  buildNode?: string[];
-  nodeRegistry?: string[];
-  releaseRegistry?: string[];
+  buildTargetOs?: string[];
+  buildTargetArch?: string[];
+  buildTargetNode?: string[];
+  buildNodepkg?: boolean;
+  publishNodepkg?: string[];
+  publishRelease?: string[];
+  publishReleaseNodepkg?: boolean;
 }) {
   return {
     build: {
-      os: options.buildOs ?? [],
-      arch: options.buildArch ?? [],
-      node: options.buildNode ?? [],
+      target: {
+        os: options.buildTargetOs ?? [],
+        arch: options.buildTargetArch ?? [],
+        node: options.buildTargetNode?.length
+          ? options.buildTargetNode
+          : undefined,
+      },
+      nodePkg: options.buildNodepkg,
     },
-    node: options.buildNode?.length
-      ? {
-          registries: options.nodeRegistry
-            ? parseNodePublishOption(options.nodeRegistry)
-            : undefined,
-        }
-      : undefined,
-    release: {
-      registries: options.releaseRegistry as any,
+    publish: {
+      nodePkg: options.publishNodepkg
+        ? parseNodePublishOption(options.publishNodepkg)
+        : undefined,
+      release: options.publishRelease?.map((registry) => ({
+        registry,
+        nodePkg: options.publishReleaseNodepkg,
+      })),
     },
   } as Parameters<typeof renderAction>[0];
 }
@@ -75,17 +86,20 @@ export function addRenderOptions(
 ) {
   return command
     .option(
-      "--build-os [values]",
-      "Build OSs (values: linux, win, mac or any GitHub-hosted runner)",
+      "--build-target-os [values]",
+      "OSs build target (values: linux, win, mac or any GitHub-hosted runner)",
       parseStringListOption,
       ["linux"]
     )
-    .option("--build-arch [archs]", "Build archs", parseStringListOption, [
-      "x64",
-    ])
     .option(
-      "--build-node [versions]",
-      "Node.js versions",
+      "--build-target-arch [archs]",
+      "Archs build target",
+      parseStringListOption,
+      ["x64"]
+    )
+    .option(
+      "--build-target-node [versions]",
+      "Node.js build target",
       parseStringListOption,
       pkg
         ? pkg.engines?.node
@@ -94,16 +108,28 @@ export function addRenderOptions(
         : []
     )
     .option(
-      "--node-registry [registries]",
-      "Node.js package registries (registries: gh, npm, gh:public, npm:public)",
+      "--build-nodepkg [enabled]",
+      "Build Node.js package (values: true, false)",
+      parseBooleanOption,
+      !!pkg
+    )
+    .option(
+      "--publish-nodepkg [registries]",
+      "Publish Node.js package (registries: gh, npm, gh:public, npm:public)",
       parseStringListOption,
       pkg ? ["gh:public", "npm:public"] : []
     )
     .option(
-      "--release-registry [registries]",
-      "Release registries (registries: gh)",
+      "--publish-release [registries]",
+      "Publish release (registries: gh)",
       parseStringListOption,
       ["gh"]
+    )
+    .option(
+      "--publish-release-nodepkg [enabled]",
+      "Publish Node.js package artifacts (values: true, false)",
+      parseBooleanOption,
+      !!pkg
     );
 }
 
