@@ -1,6 +1,6 @@
 import { installAction } from "./action/install-action";
 import { renderAction } from "./action/render-action";
-import { requireFile } from "./util/fs-util";
+import { checkPath, requireFile } from "./util/fs-util";
 import { red } from "chalk";
 import { Command, program } from "commander";
 import { minVersion } from "semver";
@@ -54,8 +54,11 @@ export function parseRenderActionOptions(options: {
   buildTargetNode?: string[];
   buildNodepkg?: boolean;
   publishNodepkg?: string[];
+  buildImage?: boolean;
+  publishImage?: string[];
   publishRelease?: string[];
   publishReleaseNodepkg?: boolean;
+  publishReleaseImage?: boolean;
 }) {
   return {
     build: {
@@ -67,6 +70,7 @@ export function parseRenderActionOptions(options: {
           : undefined,
       },
       nodePkg: options.buildNodepkg,
+      image: options.buildImage,
     },
     publish: {
       nodePkg: options.publishNodepkg
@@ -75,6 +79,10 @@ export function parseRenderActionOptions(options: {
       release: options.publishRelease?.map((registry) => ({
         registry,
         nodePkg: options.publishReleaseNodepkg,
+        image: options.publishReleaseImage,
+      })),
+      image: options.publishImage?.map((registry) => ({
+        registry,
       })),
     },
   } as Parameters<typeof renderAction>[0];
@@ -82,7 +90,8 @@ export function parseRenderActionOptions(options: {
 
 export function addRenderOptions(
   command: Command,
-  pkg: PackageType | undefined
+  pkg: PackageType | undefined,
+  dockerfile?: boolean
 ) {
   return command
     .option(
@@ -114,10 +123,22 @@ export function addRenderOptions(
       !!pkg
     )
     .option(
+      "--build-image [enabled]",
+      "Build image (values: true, false)",
+      parseBooleanOption,
+      !!dockerfile
+    )
+    .option(
       "--publish-nodepkg [registries]",
       "Publish Node.js package (registries: gh, npm, gh:public, npm:public)",
       parseStringListOption,
       pkg ? ["gh:public", "npm:public"] : []
+    )
+    .option(
+      "--publish-image [registries]",
+      "Publish image (registries: gh)",
+      parseStringListOption,
+      dockerfile ? ["gh"] : []
     )
     .option(
       "--publish-release [registries]",
@@ -130,14 +151,21 @@ export function addRenderOptions(
       "Publish Node.js package artifacts (values: true, false)",
       parseBooleanOption,
       !!pkg
+    )
+    .option(
+      "--publish-release-image [enabled]",
+      "Publish image artifacts (values: true, false)",
+      parseBooleanOption,
+      !!dockerfile
     );
 }
 
 export default async () => {
   const pkg = await requireFile<PackageType>("./package.json", true);
+  const dockerfile = await checkPath("Dockerfile");
 
   const renderCommand = program.command("render");
-  addRenderOptions(renderCommand, pkg);
+  addRenderOptions(renderCommand, pkg, dockerfile);
   renderCommand.action(
     makeAction(async (options) => {
       const renderOptions = parseRenderActionOptions(options);
@@ -153,7 +181,7 @@ export default async () => {
       "Output path",
       ".github/workflows/ci.yaml"
     );
-  addRenderOptions(installCommand, pkg);
+  addRenderOptions(installCommand, pkg, dockerfile);
   installCommand.action(
     makeAction(async (options: { output: string }) => {
       const renderOptions = parseRenderActionOptions(options as any);
